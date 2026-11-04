@@ -38,6 +38,10 @@ import numpy as np
 INDEX = "hnsw_idx"
 DATABASE = "amd_hipvs_benchmark"
 K = 10
+# ARRAY/VECTOR float display goes through OB_GCVT_ARG_FLOAT and FLT_DIG=6.
+# Storage identity is checked independently with SQL against a .9g literal.
+VECTOR_DISPLAY_RTOL = 5.1e-6
+STORED_VECTOR_L2_TOLERANCE = 1e-7
 PARAMETERS = {
     "memory_budget": "8G",
     "vector_memory_limit": "3G",
@@ -613,6 +617,42 @@ class SqlEvidence:
             self.save()
 
 
+def validate_stored_vectors(table, expected, evidence, label, absent_ids=()):
+    keys = list(expected) + list(absent_ids)
+    sql = f"SELECT id,emb FROM {table} WHERE id IN ({','.join(map(str,keys))}) ORDER BY id;"
+    raw = evidence.execute(label+"-stored-vectors",sql)
+    actual = {}
+    for line in raw.splitlines():
+        key,text = line.split("\t",1)
+        key = int(key)
+        if key in actual:
+            raise RuntimeError("duplicate primary key in stored vector output")
+        actual[key] = np.asarray(json.loads(text),dtype=np.float64)
+    if set(actual) != set(expected):
+        raise RuntimeError("stored vector IDs differ from expected present/absent primary keys")
+    display_errors,sql_distances = {},{}
+    for key,vector in expected.items():
+        if (actual[key].shape != vector.shape or not np.isfinite(actual[key]).all()
+                or not np.allclose(actual[key],vector,rtol=VECTOR_DISPLAY_RTOL,atol=0)):
+            raise RuntimeError(f"stored vector display has an incompatible shape/value for primary key {key}")
+        display_errors[str(key)] = float(np.max(np.abs(actual[key]-vector.astype(np.float64))))
+        # The formatter intentionally rounds float32 to six significant digits.
+        # A scalar SQL distance uses the actual stored vector, independent of its
+        # human-readable representation and of the approximate vector index.
+        exact_sql = (f"SELECT id,L2_DISTANCE(emb,'{vector_literal(vector)}') AS exact_source_l2 "
+                     f"FROM {table} WHERE id={key};")
+        distance_rows = parse_rows(evidence.execute(label+f"-exact-source-l2-{key}",exact_sql),expected=1)
+        returned_id,distance = distance_rows[0]
+        sql_distances[str(key)] = distance
+        if returned_id != key or distance < 0 or distance > STORED_VECTOR_L2_TOLERANCE:
+            raise RuntimeError(f"stored vector differs from exact float32 source for primary key {key}: "
+                               f"SQL L2_DISTANCE={distance}, tolerance={STORED_VECTOR_L2_TOLERANCE}")
+    return {"stored_ids":sorted(actual),"display_max_abs_value_errors":display_errors,
+            "display_relative_tolerance":VECTOR_DISPLAY_RTOL,"sql_exact_source_l2":sql_distances,
+            "sql_l2_tolerance":STORED_VECTOR_L2_TOLERANCE,
+            "absent_ids":list(absent_ids)}
+
+
 def validate_snapshot_state(server, table, state, evidence, label):
     count = int(evidence.execute(label+"-count",f"SELECT COUNT(*) FROM {table};").strip())
     if count != state["count"]:
@@ -620,22 +660,8 @@ def validate_snapshot_state(server, table, state, evidence, label):
     expected = {state["updated_id"]:state["updated_vector"],
                 state["inserted_id"]:state["inserted_vector"],
                 state["unchanged_id"]:state["unchanged_vector"]}
-    keys = list(expected) + [state["deleted_id"]]
-    sql = f"SELECT id,emb FROM {table} WHERE id IN ({','.join(map(str,keys))}) ORDER BY id;"
-    raw = evidence.execute(label+"-stored-vectors",sql)
-    actual = {}
-    for line in raw.splitlines():
-        key,text = line.split("\t",1)
-        actual[int(key)] = np.asarray(json.loads(text),dtype=np.float32)
-    if set(actual) != set(expected):
-        raise RuntimeError("stored snapshot IDs do not reflect update/delete/insert")
-    errors = {}
-    for key,vector in expected.items():
-        if actual[key].shape != vector.shape or not np.allclose(actual[key],vector,rtol=1e-6,atol=1e-7):
-            raise RuntimeError(f"stored snapshot vector differs for primary key {key}")
-        errors[str(key)] = float(np.max(np.abs(actual[key].astype(np.float64)-vector)))
-    return {"count":count,"stored_ids":sorted(actual),"max_abs_value_errors":errors,
-            "deleted_id_absent":state["deleted_id"] not in actual}
+    stored = validate_stored_vectors(table,expected,evidence,label,[state["deleted_id"]])
+    return {"count":count,**stored,"deleted_id_absent":True}
 
 
 def snapshot_ann_checks(server, table, state, evidence, label):
@@ -680,15 +706,8 @@ def snapshot_dml_check(server, table, x, ids, destination):
     checkpoint = server.checkpoint()
     try:
         original_keys = [state["updated_id"],state["deleted_id"],state["unchanged_id"]]
-        original = evidence.execute("original-snapshot-values",
-            f"SELECT id,emb FROM {table} WHERE id IN ({','.join(map(str,original_keys))}) ORDER BY id;")
-        values = {int(line.split("\t",1)[0]):np.asarray(json.loads(line.split("\t",1)[1]),dtype=np.float32)
-                  for line in original.splitlines()}
-        if set(values) != set(original_keys):
-            raise RuntimeError("original snapshot primary keys are absent before mutation")
-        for i,key in enumerate(original_keys):
-            if values[key].shape != x[i].shape or not np.allclose(values[key],x[i],rtol=1e-6,atol=1e-7):
-                raise RuntimeError("original snapshot vector differs before mutation")
+        result["original_snapshot_storage"] = validate_stored_vectors(
+            table,{key:x[i] for i,key in enumerate(original_keys)},evidence,"original-snapshot")
         evidence.execute("update-original-snapshot-id",
             f"UPDATE {table} SET emb='{vector_literal(state['updated_vector'])}' WHERE id={state['updated_id']};")
         evidence.execute("delete-original-snapshot-id",f"DELETE FROM {table} WHERE id={state['deleted_id']};")
@@ -862,6 +881,27 @@ def self_check():
     assert hashlib.sha256(snapshot_x.tobytes()).hexdigest() == original_vectors_hash
     assert hashlib.sha256(snapshot_ids.tobytes()).hexdigest() == original_ids_hash
     assert rebuild_sql("vectors_10000") == "CALL DBMS_VECTOR.REBUILD_INDEX('hnsw_idx','vectors_10000','emb',0);"
+    rounded_source = np.asarray([.18905849,.000010000049,1234,-1234,0],dtype=np.float32)
+    rounded_display = "["+",".join(format(float(v),".6g") for v in rounded_source)+"]"
+    assert not np.allclose(np.asarray(json.loads(rounded_display)),rounded_source,rtol=1e-6,atol=1e-7)
+    class RoundedStorageFixture:
+        distance = 0
+        calls = []
+        def execute(self,label,sql):
+            self.calls.append(sql)
+            return "7\t"+rounded_display+"\n" if sql.startswith("SELECT id,emb ") else f"7\t{self.distance}\n"
+    fixture = RoundedStorageFixture()
+    stored = validate_stored_vectors("fixture",{7:rounded_source},fixture,"rounded")
+    assert stored["sql_exact_source_l2"]["7"] == 0
+    assert any(vector_literal(rounded_source) in sql for sql in fixture.calls)
+    # A real stored change hidden by the same display still fails the SQL check.
+    fixture.distance = 2e-7
+    try:
+        validate_stored_vectors("fixture",{7:rounded_source},fixture,"corrupt")
+    except RuntimeError as e:
+        assert "SQL L2_DISTANCE" in str(e)
+    else:
+        raise AssertionError("SQL storage mismatch was masked by rounded display tolerance")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         base_path, query_path = root/"base.f32", root/"query.f32"
@@ -944,7 +984,8 @@ def self_check():
     print("self-check passed: deterministic float32 data, independent queries, exact L2 oracle, "
           "reference file validation/SHA256/prefix selection, configurable HNSW SQL, IDs/distances, "
           "per-connection session ef, snapshot mutation input isolation/IDs, forced rebuild SQL, "
-          "JSON evidence parsing, log rotation checkpoints, plan recognition, paired medians")
+          "rounded display vs exact SQL storage checks, JSON evidence parsing, log rotation checkpoints, "
+          "plan recognition, paired medians")
 
 
 def parse_args(argv=None):
