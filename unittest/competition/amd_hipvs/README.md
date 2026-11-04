@@ -4,6 +4,8 @@ seekdb 收集完整 snapshot 的向量与 VID，在序列化和发布索引前�
 
 当前 GPU 路径支持 FP32、L2、普通 HNSW snapshot。NN-descent 在 GPU 上构建底层图，CPU 构建上层层级。构建器输出保留原始 int64 VID，并校验图边、层级和序列化布局。
 
+收集向量和 VID 的缓存使用索引的向量内存分配器，受向量内存预算约束。构建子进程超时后，父进程回收本次私有目录中的输入、输出和未完成的临时图文件。
+
 ## 编译
 
 按项目构建流程准备依赖并编译 seekdb。在安装 ROCm 和 hipVS 开发库的 AMD Linux 环境中编译构建器：
@@ -69,11 +71,13 @@ python unittest/competition/amd_hipvs/benchmark.py \
 
 程序在本地文件系统创建两个独立实例，使用 2881、2882 端口。CPU/GPU 使用相同二进制、资源配置、数据、索引参数和查询集，交替执行至少三轮全新索引构建。计时从发送 `CREATE VECTOR INDEX` 开始，到索引可执行首个近邻查询为止，覆盖扫描、传输、同步、格式转换和索引发布。数据生成、原始数据导入、实例启动和质量检查分别记录。
 
-`results.json` 保存每轮耗时、中位数加速比、Recall@10、文档 ID 与距离检查、执行计划、GPU 构建日志、二进制 SHA256 和环境配置。程序还验证实例重启后的查询结果，以及新增、更新和删除。通过 `--min-recall` 指定质量门槛，使用比赛统一配置判断结果。
+程序对每条 SQL 连接显式设置 `ob_hnsw_ef_search`，读取并保存实际会话值，保证 CPU/GPU 使用相同查询预算。
+
+`results.json` 保存每轮耗时、中位数加速比、Recall@10、文档 ID 与距离检查、执行计划、GPU 构建日志、二进制 SHA256 和环境配置。程序还验证实例重启后的查询结果，以及对原有 snapshot 行的更新、删除和新行插入，并在这些变更后再次重启核对。添加 `--check-rebuild` 可继续检查强制重建及其完成日志。通过 `--min-recall` 指定质量门槛，使用比赛统一配置判断结果。
 
 ## 回归检查
 
-进程桥测试在 Linux 上使用 CPU fixture 验证成功、错误和超时路径：
+进程桥测试在 Linux 上使用 CPU 测试程序验证成功、错误和超时路径：
 
 ```bash
 python unittest/competition/amd_hipvs/test_process_bridge.py

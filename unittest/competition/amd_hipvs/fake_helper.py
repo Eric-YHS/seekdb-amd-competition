@@ -31,15 +31,20 @@ assert struct.unpack('2q', open(options['--input-ids'], 'rb').read()) == (100, 2
 assert os.stat(os.path.dirname(options['--output'])).st_mode & 0o777 == 0o700
 mode = os.environ.get('SEEKDB_TEST_MODE', 'success')
 output = options['--output']
-if mode == 'nonzero':
+if mode in ('nonzero_temp', 'signal_temp', 'timeout_temp'):
+    with open(output + '.tmp.test', 'wb') as stream:
+        stream.write(b'partial serialized graph\n' * 4096)
+    os.symlink(os.environ['SEEKDB_TEST_SENTINEL'], output + '.tmp.symlink')
+failure = mode[:-5] if mode.endswith('_temp') else mode
+if failure == 'nonzero':
     sys.stderr.write('DISCARD_PREFIX' + 'x' * 6000 + 'KEEP_STDERR_TAIL\n')
     sys.exit(17)
-if mode == 'signal':
+if failure == 'signal':
     import signal
     sys.stderr.write('SIGNAL_STDERR\n')
     sys.stderr.flush()
     os.kill(os.getpid(), signal.SIGTERM)
-if mode == 'timeout':
+if failure == 'timeout':
     open(os.environ['SEEKDB_TEST_PIDFILE'], 'w').write(str(os.getpid()))
     sys.stderr.write('TIMEOUT_STDERR\n')
     sys.stderr.flush()

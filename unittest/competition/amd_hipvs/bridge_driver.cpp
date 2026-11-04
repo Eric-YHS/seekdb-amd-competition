@@ -44,6 +44,11 @@ int main(int argc, char **argv) {
     fs::path helper = root / "helper with spaces.py";
     fs::path temporary = root / "temporary with spaces";
     fs::create_directories(temporary);
+    fs::path sentinel = root / "outside cleanup sentinel";
+    {
+      std::ofstream(sentinel) << "preserve this external file\n";
+    }
+    setenv("SEEKDB_TEST_SENTINEL", sentinel.c_str(), 1);
     setenv("SEEKDB_HIPVS_BUILDER", helper.c_str(), 1);
     setenv("SEEKDB_HIPVS_TMPDIR", temporary.c_str(), 1);
     unsetenv("SEEKDB_HIPVS_THREADS");
@@ -61,6 +66,10 @@ int main(int argc, char **argv) {
       check(ret == expected,
             name + " returned " + std::to_string(ret) + ": " + error);
       check(fs::is_empty(temporary), name + " leaked temporary files");
+      std::string sentinel_content;
+      std::getline(std::ifstream(sentinel), sentinel_content);
+      check(sentinel_content == "preserve this external file",
+            name + " followed a cleanup symlink outside the private directory");
       if (ret != OB_SUCCESS) {
         check(serialized.empty(), name + " retained serialized data on error");
         check(!error.empty(), name + " lost error");
@@ -78,16 +87,20 @@ int main(int argc, char **argv) {
     invoke("threads upper boundary", OB_SUCCESS);
     unsetenv("SEEKDB_HIPVS_THREADS");
     unsetenv("SEEKDB_TEST_EXPECT_THREADS");
-    for (const char *mode : {"nonzero", "signal", "symlink", "fifo",
-                             "truncated", "oversized", "missing_output"}) {
+    for (const char *mode :
+         {"nonzero", "signal", "nonzero_temp", "signal_temp", "symlink", "fifo",
+          "truncated", "oversized", "missing_output"}) {
       setenv("SEEKDB_TEST_MODE", mode, 1);
-      const int expected =
-          std::string(mode) == "nonzero" || std::string(mode) == "signal"
-              ? OB_ERR_UNEXPECTED
-          : std::string(mode) == "oversized" ? OB_SIZE_OVERFLOW
-                                             : OB_IO_ERROR;
+      const int expected = std::string(mode) == "nonzero" ||
+                                   std::string(mode) == "signal" ||
+                                   std::string(mode) == "nonzero_temp" ||
+                                   std::string(mode) == "signal_temp"
+                               ? OB_ERR_UNEXPECTED
+                           : std::string(mode) == "oversized" ? OB_SIZE_OVERFLOW
+                                                              : OB_IO_ERROR;
       invoke(mode, expected);
-      if (std::string(mode) == "nonzero") {
+      if (std::string(mode) == "nonzero" ||
+          std::string(mode) == "nonzero_temp") {
         check(error.find("17") != std::string::npos &&
                   error.find("KEEP_STDERR_TAIL") != std::string::npos,
               "nonzero exit lost status/stderr");
@@ -124,26 +137,28 @@ int main(int argc, char **argv) {
     setenv("SEEKDB_HIPVS_TIMEOUT_SECONDS", "86400", 1);
     invoke("timeout upper boundary", OB_SUCCESS);
     setenv("SEEKDB_HIPVS_TIMEOUT_SECONDS", "1", 1);
-    setenv("SEEKDB_TEST_MODE", "timeout", 1);
     fs::path pid_file = root / "timeout.pid";
     setenv("SEEKDB_TEST_PIDFILE", pid_file.c_str(), 1);
-    auto started = std::chrono::steady_clock::now();
-    invoke("timeout kills and reaps helper", OB_TIMEOUT);
-    double elapsed = std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - started)
-                         .count();
-    check(elapsed >= .9 && elapsed < 5,
-          "timeout duration wrong: " + std::to_string(elapsed));
-    check(error.find("TIMEOUT_STDERR") != std::string::npos,
-          "timeout lost stderr");
-    int pid = 0;
-    std::ifstream(pid_file) >> pid;
-    check(pid > 0 && kill(pid, 0) == -1 && errno == ESRCH,
-          "timeout child is still live or unreaped");
-    int status = 0;
-    check(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD,
-          "bridge left an unreaped child");
-    std::cout << "TIMEOUT_ELAPSED_SECONDS " << elapsed << '\n';
+    for (const char *mode : {"timeout", "timeout_temp"}) {
+      setenv("SEEKDB_TEST_MODE", mode, 1);
+      auto started = std::chrono::steady_clock::now();
+      invoke(std::string(mode) + " kills and reaps helper", OB_TIMEOUT);
+      double elapsed = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+      check(elapsed >= .9 && elapsed < 5,
+            "timeout duration wrong: " + std::to_string(elapsed));
+      check(error.find("TIMEOUT_STDERR") != std::string::npos,
+            "timeout lost stderr");
+      int pid = 0;
+      std::ifstream(pid_file) >> pid;
+      check(pid > 0 && kill(pid, 0) == -1 && errno == ESRCH,
+            "timeout child is still live or unreaped");
+      int status = 0;
+      check(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD,
+            "bridge left an unreaped child");
+      std::cout << "TIMEOUT_ELAPSED_SECONDS " << elapsed << '\n';
+    }
     std::cout << "ALL_PASS " << count << '\n';
     return 0;
   } catch (const std::exception &exception) {

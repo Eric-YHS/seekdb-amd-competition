@@ -227,12 +227,28 @@ def helper_records(text):
     return list(records.values())
 
 
+def rebuild_completion_evidence(text):
+    ddl = [line for line in text.splitlines() if "succ to wait rebuild vec index" in line]
+    manual = []
+    for line in text.splitlines():
+        if "end do_work" not in line or "ob_vector_index_async_task_util.cpp" not in line:
+            continue
+        # ObVecIndexTaskStatus fields are integer values. Manual optimization is
+        # trigger_type=1, task_type=1; CALL separately waits for task history.
+        matches = [re.search(r"\b"+name+r"\s*[:=]\s*"+str(value)+r"\b",line)
+                   for name,value in [("trigger_type",1),("task_type",1),("ret_code",0)]]
+        if all(matches):
+            manual.append(line)
+    return {"ddl_wait_lines":ddl,"manual_optimization_success_lines":manual,
+            "completed":bool(ddl or manual)}
+
+
 def index_plan_ok(text):
     return "VECTOR INDEX" in text.upper() and INDEX.lower() in text.lower()
 
 
 class Server:
-    def __init__(self, mode, port, binary, helper, mysql, base, output):
+    def __init__(self, mode, port, binary, helper, mysql, base, output, index_parameters):
         self.mode, self.port, self.binary = mode, port, binary
         self.helper, self.mysql = helper, mysql
         self.base, self.output = Path(base), Path(output)
@@ -241,6 +257,7 @@ class Server:
         self.proc = None
         self.generation = 0
         self.commands = self.output / "commands.jsonl"
+        self.index_parameters = dict(index_parameters)
         self.env = os.environ.copy()
         self.env.update({"SEEKDB_HIPVS_BUILD": "1" if mode == "gpu" else "0",
                          "SEEKDB_HIPVS_BUILDER": str(helper), "SEEKDB_HIPVS_THREADS": "16",
@@ -249,7 +266,9 @@ class Server:
 
     def describe(self):
         return {"mode": self.mode, "port": self.port, "base_dir": str(self.base),
-                "env": {k: v for k, v in self.env.items() if k.startswith("SEEKDB_HIPVS_")},
+                "env": {k: v for k, v in self.env.items()
+                        if k.startswith("SEEKDB_HIPVS_") or k == "OMP_NUM_THREADS"},
+                "session_ob_hnsw_ef_search": self.index_parameters["ef_search"],
                 "startup": self.startup}
 
     def mysql_command(self):
@@ -263,7 +282,8 @@ class Server:
             cmd.append(DATABASE)
         started = time.perf_counter()
         # Each new CLI connection needs a DDL timeout longer than the workload.
-        prefix = "SET SESSION ob_query_timeout=7200000000;\n"
+        prefix = ("SET SESSION ob_query_timeout=7200000000;\n"
+                  f"SET SESSION ob_hnsw_ef_search={self.index_parameters['ef_search']};\n")
         if path is None:
             p = subprocess.run(cmd, input=prefix + sql, text=True, capture_output=True,
                                env=self.env, timeout=timeout)
@@ -280,6 +300,7 @@ class Server:
         if record:
             with self.commands.open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"at": now(), "sql": sql, "input_file": str(path) if path else None,
+                                    "session_prefix": prefix,
                                     "seconds": duration, "exit": p.returncode,
                                     "stdout": p.stdout, "stderr": p.stderr}) + "\n")
         if p.returncode:
@@ -309,12 +330,17 @@ class Server:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.mode} server exited during startup: {self.proc.returncode}")
             try:
-                self.sql("SELECT 1;", database=False, timeout=5, record=False)
-                entry["ready_seconds"] = time.perf_counter() - started
-                entry["ready_at"] = now()
-                return
+                effective, _ = self.sql("SELECT @@SESSION.ob_hnsw_ef_search;", database=False,
+                                        timeout=5, record=False)
             except (RuntimeError, subprocess.TimeoutExpired):
                 time.sleep(1)
+                continue
+            if int(effective.strip()) != self.index_parameters["ef_search"]:
+                raise RuntimeError(f"{self.mode} effective session ob_hnsw_ef_search differs from CLI")
+            entry["effective_session_ob_hnsw_ef_search"] = int(effective.strip())
+            entry["ready_seconds"] = time.perf_counter() - started
+            entry["ready_at"] = now()
+            return
         raise RuntimeError(f"{self.mode} server startup timed out")
 
     def stop(self):
@@ -360,7 +386,7 @@ class Server:
                         archive.write(f"\nFILE {path} OFFSET {offset}\n".encode())
                         for line in stream:
                             archive.write(line)
-                            if b"hipvs" in line.lower() or b'"backend":"hipVS"' in line:
+                            if self.evidence_line(line):
                                 selected.append(line.decode("utf-8", errors="replace"))
                 except FileNotFoundError:
                     continue
@@ -369,8 +395,36 @@ class Server:
         return {"raw_log_archive": str(destination) + ".logs.gz",
                 "hipvs_excerpt": str(destination) + ".hipvs.log",
                 "completion_lines": sum("hipVS HNSW construction complete" in line for line in selected),
+                "rebuild_completion_lines": sum("succ to wait rebuild vec index" in line for line in selected),
+                "rebuild_completion_evidence": rebuild_completion_evidence(text),
                 "fallback_lines": [line.strip() for line in selected if "fallback" in line.lower()],
                 "helper_records": helper_records(text)}
+
+    @staticmethod
+    def evidence_line(line):
+        lower = line.lower()
+        return (b"hipvs" in lower or b"rebuild vec index" in lower or b"rebuild vector index" in lower
+                or (b"end do_work" in lower and b"ob_vector_index_async_task_util.cpp" in lower))
+
+    def evidence_since(self, checkpoint):
+        """Read the evidence subset while polling, without rewriting archives."""
+        selected, seen = [], set()
+        for path in self.log_files():
+            try:
+                st = path.stat()
+                inode = (st.st_dev, st.st_ino)
+                if inode in seen:
+                    continue
+                seen.add(inode)
+                offset = checkpoint.get(inode, 0)
+                with path.open("rb") as stream:
+                    stream.seek(offset if offset <= st.st_size else 0)
+                    for line in stream:
+                        if self.evidence_line(line):
+                            selected.append(line.decode("utf-8", errors="replace"))
+            except FileNotFoundError:
+                continue
+        return "".join(selected)
 
 
 def quality(server, table, x, ids, queries, oracle, destination, min_recall=None):
@@ -497,6 +551,240 @@ def dml_check(server, dim, seed, destination, index_parameters):
     return result
 
 
+def snapshot_mutation_state(x, ids):
+    """Copy the imported snapshot; the benchmark input/oracle stays unchanged."""
+    if len(ids) < 10000 or len(ids) != len(x):
+        raise ValueError("snapshot DML requires a completed snapshot with at least 10000 rows")
+    dim = x.shape[1]
+    updated = np.full(dim, -1234, dtype=np.float32)
+    inserted = np.full(dim, 1234, dtype=np.float32)
+    if np.any(np.all(x == updated, axis=1)) or np.any(np.all(x == inserted, axis=1)):
+        raise ValueError("snapshot already contains one of the reserved mutation vectors")
+    added_id = 9000000000000000002
+    if added_id in set(map(int,ids)):
+        raise ValueError("snapshot already contains the reserved mutation primary key")
+    changed_x = np.concatenate([updated[None,:], x[2:].copy(), inserted[None,:]])
+    changed_ids = np.concatenate([ids[:1].copy(), ids[2:].copy(), np.array([added_id],dtype=np.int64)])
+    return {"x":changed_x,"ids":changed_ids,"count":len(ids),
+            "updated_id":int(ids[0]),"deleted_id":int(ids[1]),"inserted_id":added_id,
+            "updated_vector":updated,"inserted_vector":inserted,
+            "old_updated_vector":x[0].copy(),"old_deleted_vector":x[1].copy(),
+            "unchanged_id":int(ids[2]),"unchanged_vector":x[2].copy()}
+
+
+class SqlEvidence:
+    """Keep complete SQL and raw results next to a postcheck's assertions."""
+    def __init__(self, server, directory, result):
+        self.server, self.directory, self.result = server, Path(directory), result
+        self.directory.mkdir(parents=True,exist_ok=True)
+        self.result.setdefault("sql_steps",[])
+
+    def save(self):
+        write_json(self.directory/"results.json",self.result)
+
+    def execute(self, label, sql, timeout=7200):
+        entry = {"label":label,"at":now(),"sql":sql,"status":"running"}
+        self.result["sql_steps"].append(entry)
+        with (self.directory/"statements.sql").open("a",encoding="utf-8") as f:
+            f.write(f"-- {label}\n{sql}\n")
+        self.save()
+        try:
+            stdout,duration = self.server.sql(sql,timeout=timeout)
+            entry.update({"status":"ok","stdout":stdout,"client_seconds":duration})
+            return stdout
+        except BaseException as e:
+            entry.update({"status":"failed","error":repr(e)})
+            raise
+        finally:
+            self.save()
+
+
+def validate_snapshot_state(server, table, state, evidence, label):
+    count = int(evidence.execute(label+"-count",f"SELECT COUNT(*) FROM {table};").strip())
+    if count != state["count"]:
+        raise RuntimeError(f"{server.mode} snapshot row count changed: {count} != {state['count']}")
+    expected = {state["updated_id"]:state["updated_vector"],
+                state["inserted_id"]:state["inserted_vector"],
+                state["unchanged_id"]:state["unchanged_vector"]}
+    keys = list(expected) + [state["deleted_id"]]
+    sql = f"SELECT id,emb FROM {table} WHERE id IN ({','.join(map(str,keys))}) ORDER BY id;"
+    raw = evidence.execute(label+"-stored-vectors",sql)
+    actual = {}
+    for line in raw.splitlines():
+        key,text = line.split("\t",1)
+        actual[int(key)] = np.asarray(json.loads(text),dtype=np.float32)
+    if set(actual) != set(expected):
+        raise RuntimeError("stored snapshot IDs do not reflect update/delete/insert")
+    errors = {}
+    for key,vector in expected.items():
+        if actual[key].shape != vector.shape or not np.allclose(actual[key],vector,rtol=1e-6,atol=1e-7):
+            raise RuntimeError(f"stored snapshot vector differs for primary key {key}")
+        errors[str(key)] = float(np.max(np.abs(actual[key].astype(np.float64)-vector)))
+    return {"count":count,"stored_ids":sorted(actual),"max_abs_value_errors":errors,
+            "deleted_id_absent":state["deleted_id"] not in actual}
+
+
+def snapshot_ann_checks(server, table, state, evidence, label):
+    mapping = {int(v):i for i,v in enumerate(state["ids"])}
+    cases = [("updated-original-id",state["updated_vector"],state["updated_id"],[]),
+             ("inserted-id",state["inserted_vector"],state["inserted_id"],[]),
+             ("old-updated-location",state["old_updated_vector"],None,[state["updated_id"]]),
+             ("old-deleted-location",state["old_deleted_vector"],None,[state["deleted_id"]])]
+    checks = {}
+    for name,query,required,forbidden in cases:
+        tag = label+"-"+name
+        sql = query_sql(table,query)
+        text = evidence.execute(tag,sql)
+        rows = parse_rows(text)
+        oracle = exact_topk(state["x"],state["ids"],query[None,:])[0]
+        sample = assess(rows,query,state["x"],mapping,oracle)
+        if required is not None and (rows[0][0] != required or abs(rows[0][1]) > 1e-6):
+            raise RuntimeError(f"{server.mode} {name} is not returned at its exact new location")
+        if any(key in sample["ids"] for key in forbidden):
+            raise RuntimeError(f"{server.mode} stale ID returned at {name}")
+        # Every result passes through the mutated ID map, so the deleted ID is
+        # rejected for all probes rather than only its old vector probe.
+        explain = evidence.execute(tag+"-explain","EXPLAIN "+sql)
+        explain_path = evidence.directory/(tag+".explain.txt")
+        explain_path.write_text(explain,encoding="utf-8")
+        if not index_plan_ok(explain):
+            raise RuntimeError(f"{server.mode} snapshot mutation probe does not use {INDEX}")
+        sample.update({"oracle":oracle,"explain":str(explain_path)})
+        checks[name] = sample
+    return checks
+
+
+def snapshot_dml_check(server, table, x, ids, destination):
+    input_hashes = {"vectors":hashlib.sha256(x.tobytes()).hexdigest(),
+                    "ids":hashlib.sha256(ids.tobytes()).hexdigest()}
+    state = snapshot_mutation_state(x,ids)
+    result = {"status":"running","excluded_from_build_measurement":True,
+              "table":table,"snapshot_rows":len(ids),"original_updated_id":state["updated_id"],
+              "original_deleted_id":state["deleted_id"],"inserted_id":state["inserted_id"],
+              "benchmark_input_sha256":input_hashes}
+    evidence = SqlEvidence(server,destination,result)
+    checkpoint = server.checkpoint()
+    try:
+        original_keys = [state["updated_id"],state["deleted_id"],state["unchanged_id"]]
+        original = evidence.execute("original-snapshot-values",
+            f"SELECT id,emb FROM {table} WHERE id IN ({','.join(map(str,original_keys))}) ORDER BY id;")
+        values = {int(line.split("\t",1)[0]):np.asarray(json.loads(line.split("\t",1)[1]),dtype=np.float32)
+                  for line in original.splitlines()}
+        if set(values) != set(original_keys):
+            raise RuntimeError("original snapshot primary keys are absent before mutation")
+        for i,key in enumerate(original_keys):
+            if values[key].shape != x[i].shape or not np.allclose(values[key],x[i],rtol=1e-6,atol=1e-7):
+                raise RuntimeError("original snapshot vector differs before mutation")
+        evidence.execute("update-original-snapshot-id",
+            f"UPDATE {table} SET emb='{vector_literal(state['updated_vector'])}' WHERE id={state['updated_id']};")
+        evidence.execute("delete-original-snapshot-id",f"DELETE FROM {table} WHERE id={state['deleted_id']};")
+        evidence.execute("insert-new-id",
+            f"INSERT INTO {table}(id,emb) VALUES({state['inserted_id']},'{vector_literal(state['inserted_vector'])}');")
+        result["before_restart_storage"] = validate_snapshot_state(server,table,state,evidence,"before-restart")
+        result["before_restart_ann"] = snapshot_ann_checks(server,table,state,evidence,"before-restart")
+        evidence.save()
+        server.stop()
+        server.start()
+        result["after_restart_storage"] = validate_snapshot_state(server,table,state,evidence,"after-restart")
+        result["after_restart_ann"] = snapshot_ann_checks(server,table,state,evidence,"after-restart")
+        result["ann_ids_identical_after_restart"] = all(
+            result["before_restart_ann"][case]["ids"] == sample["ids"]
+            for case,sample in result["after_restart_ann"].items())
+        result["benchmark_inputs_unchanged"] = input_hashes == {
+            "vectors":hashlib.sha256(x.tobytes()).hexdigest(),"ids":hashlib.sha256(ids.tobytes()).hexdigest()}
+        if not result["benchmark_inputs_unchanged"]:
+            raise RuntimeError("snapshot mutation modified the benchmark input arrays")
+        result["status"] = "ok"
+        return result,state
+    except BaseException as e:
+        result.update({"status":"failed","error":repr(e)})
+        raise
+    finally:
+        result["log_evidence"] = server.capture_logs(checkpoint,Path(destination)/"server")
+        evidence.save()
+
+
+def rebuild_sql(table):
+    # ob_dbms_vector_mysql.cpp defines the fourth argument as delta threshold;
+    # ob_vector_index_refresh.cpp:524 bypasses the threshold check when it is 0,
+    # submits a rebuild task, and waits for its asynchronous DDL at line 598.
+    # Hybrid HNSW dispatches manual optimization at line 610; its task manager
+    # also waits for asynchronous task history before CALL returns.
+    return f"CALL DBMS_VECTOR.REBUILD_INDEX('{INDEX}','{table}','emb',0);"
+
+
+def rebuild_check(server, table, state, destination, timeout):
+    result = {"status":"running","excluded_from_build_measurement":True,"table":table,
+              "operation":"DBMS_VECTOR.REBUILD_INDEX with delta threshold 0",
+              "source_references":["src/pl/sys_package/ob_dbms_vector_mysql.cpp:66",
+                                   "src/sql/engine/cmd/ob_vector_index_refresh.cpp:524",
+                                   "src/sql/engine/cmd/ob_vector_index_refresh.cpp:598",
+                                   "src/sql/engine/cmd/ob_vector_index_refresh.cpp:610",
+                                   "src/observer/vector_index/ob_vector_index_async_task.cpp:307"],
+              "polls":[]}
+    evidence = SqlEvidence(server,destination,result)
+    checkpoint = server.checkpoint()
+    try:
+        started = time.perf_counter()
+        # CALL waits for the internally asynchronous rebuild DDL. Poll afterward
+        # until its new build logs and queryable published index are both seen.
+        evidence.execute("force-rebuild",rebuild_sql(table),timeout=timeout)
+        result["call_seconds"] = time.perf_counter()-started
+        deadline = time.monotonic()+min(timeout,60)
+        while True:
+            text = server.evidence_since(checkpoint)
+            records = helper_records(text)
+            full_rows = max([int(r.get("rows",0)) for r in records
+                             if int(r.get("dim",0)) == state["x"].shape[1]] or [0])
+            completion = rebuild_completion_evidence(text)
+            waited = completion["completed"]
+            full_snapshot = any(int(r.get("rows",0)) == state["count"]
+                                and int(r.get("dim",0)) == state["x"].shape[1] for r in records)
+            gpu_ok = ("hipVS HNSW construction complete" in text and full_snapshot
+                      ) if server.mode == "gpu" else not records
+            poll = {"at":now(),"async_completion_evidence":completion,"helper_records":records,
+                    "largest_helper_rows":full_rows,"gpu_evidence_ok":gpu_ok,
+                    "fallback_lines":[line for line in text.splitlines() if "fallback" in line.lower()]}
+            # A successful old-generation query alone cannot prove rebuild;
+            # require it together with the new DDL and full-row GPU evidence.
+            probe = query_sql(table,state["inserted_vector"])
+            try:
+                rows = parse_rows(evidence.execute("rebuild-poll-query",probe,timeout=30))
+                explain = evidence.execute("rebuild-poll-explain","EXPLAIN "+probe,timeout=30)
+                poll["query_available"] = (rows[0][0] == state["inserted_id"]
+                                           and abs(rows[0][1]) <= 1e-6 and index_plan_ok(explain))
+                poll["probe_rows"] = rows
+            except (RuntimeError,subprocess.TimeoutExpired) as e:
+                poll["query_available"] = False
+                poll["query_error"] = repr(e)
+            result["polls"].append(poll)
+            evidence.save()
+            if waited and gpu_ok and poll["query_available"]:
+                result["after_rebuild_storage"] = validate_snapshot_state(server,table,state,evidence,"after-rebuild")
+                result["after_rebuild_ann"] = snapshot_ann_checks(server,table,state,evidence,"after-rebuild")
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("forced rebuild lacks new completion/GPU coverage evidence")
+            if server.proc.poll() is not None:
+                raise RuntimeError("server exited while waiting for forced rebuild evidence")
+            time.sleep(1)
+        result["rebuild_to_verified_seconds"] = time.perf_counter()-started
+        result["log_evidence"] = server.capture_logs(checkpoint,Path(destination)/"rebuild-server")
+        server.stop()
+        server.start()
+        result["after_restart_storage"] = validate_snapshot_state(server,table,state,evidence,"after-rebuild-restart")
+        result["after_restart_ann"] = snapshot_ann_checks(server,table,state,evidence,"after-rebuild-restart")
+        result["status"] = "ok"
+        return result
+    except BaseException as e:
+        result.update({"status":"failed","error":repr(e)})
+        raise
+    finally:
+        if "log_evidence" not in result:
+            result["log_evidence"] = server.capture_logs(checkpoint,Path(destination)/"rebuild-server")
+        evidence.save()
+
+
 def summarize(records):
     result = {}
     for size in sorted({r["rows"] for r in records}):
@@ -518,6 +806,8 @@ def summarize(records):
 
 
 def self_check():
+    from unittest.mock import patch
+
     x, ids, q = dataset(128, 8, 3, 42)
     x2, ids2, q2 = dataset(128, 8, 3, 42)
     assert np.array_equal(x, x2) and np.array_equal(ids, ids2) and np.array_equal(q, q2)
@@ -533,11 +823,31 @@ def self_check():
     j = '{"status":"ok","backend":"hipVS","rows":128,"dim":8}'
     assert len(helper_records("log diagnostics="+j+"\n"+j)) == 1
     assert len(helper_records(j.replace('"', '\\"'))) == 1
+    async_success = ("ob_vector_index_async_task_util.cpp:1195 end do_work "
+                     "task_status={trigger_type:1,task_type:1,ret_code:0}")
+    assert rebuild_completion_evidence(async_success)["completed"]
+    assert not rebuild_completion_evidence(async_success.replace("ret_code:0","ret_code:-4000"))["completed"]
+    assert not rebuild_completion_evidence(async_success.replace("trigger_type:1","trigger_type:0"))["completed"]
     assert index_plan_ok("VECTOR INDEX SCAN t(hnsw_idx)")
     assert not index_plan_ok("TABLE FULL SCAN t")
     records = [{"rows":10000,"round":i,"mode":m,"status":"ok","build_to_queryable_seconds":t}
                for i in range(3) for m,t in [("cpu",2+i),("gpu",1+i)]]
     assert summarize(records)["10000"]["cpu_median_div_gpu_median"] == 1.5
+    snapshot_x,snapshot_ids,_ = dataset(10000,8,1,42)
+    original_vectors_hash = hashlib.sha256(snapshot_x.tobytes()).hexdigest()
+    original_ids_hash = hashlib.sha256(snapshot_ids.tobytes()).hexdigest()
+    mutation = snapshot_mutation_state(snapshot_x,snapshot_ids)
+    assert len(mutation["x"]) == len(mutation["ids"]) == len(snapshot_ids)
+    assert mutation["deleted_id"] not in set(map(int,mutation["ids"]))
+    assert mutation["updated_id"] == int(snapshot_ids[0])
+    mutation_oracle = exact_topk(mutation["x"],mutation["ids"],
+                                np.stack([mutation["updated_vector"],mutation["inserted_vector"]]))
+    assert mutation_oracle[0]["ids"][0] == mutation["updated_id"]
+    assert mutation_oracle[1]["ids"][0] == mutation["inserted_id"]
+    assert mutation_oracle[0]["distances"][0] == mutation_oracle[1]["distances"][0] == 0
+    assert hashlib.sha256(snapshot_x.tobytes()).hexdigest() == original_vectors_hash
+    assert hashlib.sha256(snapshot_ids.tobytes()).hexdigest() == original_ids_hash
+    assert rebuild_sql("vectors_10000") == "CALL DBMS_VECTOR.REBUILD_INDEX('hnsw_idx','vectors_10000','emb',0);"
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         base_path, query_path = root/"base.f32", root/"query.f32"
@@ -580,9 +890,23 @@ def self_check():
         parsed = parse_args(["--binary","/candidate","--helper","/helper","--output","/output",
                              "--sizes","10000","--m","32","--ef-construction","300",
                              "--ef-search","1000","--base-f32",str(base_path),
-                             "--queries-f32",str(query_path)])
+                             "--queries-f32",str(query_path),"--check-rebuild"])
         assert (parsed.m,parsed.ef_construction,parsed.ef_search) == (32,300,1000)
         assert parsed.base_f32 == base_path and parsed.queries_f32 == query_path
+        assert parsed.check_rebuild
+        for mode in ("cpu","gpu"):
+            fake_server = Server(mode,2881,Path("/candidate"),Path("/helper"),Path("/mysql"),
+                                 root/("fake-instance-"+mode),root/("fake-evidence-"+mode),options)
+            def fake_mysql(command,**kwargs):
+                assert "SET SESSION ob_hnsw_ef_search=1000;\n" in kwargs["input"]
+                return subprocess.CompletedProcess(command,0,stdout="1000\n",stderr="")
+            with patch.object(subprocess,"run",side_effect=fake_mysql):
+                output,_ = fake_server.sql("SELECT @@SESSION.ob_hnsw_ef_search;",database=False)
+            assert output.strip() == "1000"
+            logged = json.loads(fake_server.commands.read_text())
+            assert "SET SESSION ob_hnsw_ef_search=1000;" in logged["session_prefix"]
+            assert fake_server.describe()["session_ob_hnsw_ef_search"] == 1000
+            assert fake_server.describe()["env"]["OMP_NUM_THREADS"] == "16"
         server = Server.__new__(Server)
         server.base, server.output = root/"instance", root/"evidence"
         (server.base/"log").mkdir(parents=True)
@@ -594,14 +918,18 @@ def self_check():
         log.rename(log.with_name("seekdb.log.1"))
         with log.with_name("seekdb.log.1").open("a", encoding="utf-8") as f:
             f.write("hipVS HNSW construction complete diagnostics=" + j + "\n")
+            f.write("succ to wait rebuild vec index task_id=123\n")
         log.write_text("new log file\n", encoding="utf-8")
         captured = server.capture_logs(checkpoint, server.output/"round")
         assert captured["completion_lines"] == 1 and len(captured["helper_records"]) == 1
+        assert captured["rebuild_completion_lines"] == 1
+        assert "succ to wait rebuild vec index" in server.evidence_since(checkpoint)
         assert "previous run" not in Path(captured["hipvs_excerpt"]).read_text()
         with gzip.open(captured["raw_log_archive"], "rt", encoding="utf-8") as f:
             assert "new log file" in f.read()
     print("self-check passed: deterministic float32 data, independent queries, exact L2 oracle, "
           "reference file validation/SHA256/prefix selection, configurable HNSW SQL, IDs/distances, "
+          "per-connection session ef, snapshot mutation input isolation/IDs, forced rebuild SQL, "
           "JSON evidence parsing, log rotation checkpoints, plan recognition, paired medians")
 
 
@@ -622,7 +950,12 @@ def parse_args(argv=None):
     p.add_argument("--ef-search", type=int, default=1000)
     p.add_argument("--mysql", type=Path, default=Path(shutil.which("mysql") or "mysql"))
     p.add_argument("--min-recall", type=float, default=None)
-    p.add_argument("--skip-postchecks", action="store_true", help="skip restart and separate DML checks")
+    p.add_argument("--skip-postchecks", action="store_true",
+                   help="skip restart, original-snapshot mutations and separate DML checks")
+    p.add_argument("--check-rebuild", action="store_true",
+                   help="after snapshot DML, force DBMS_VECTOR rebuild, verify new build logs, queries and restart")
+    p.add_argument("--rebuild-timeout", type=int, default=1800,
+                   help="seconds allowed for the optional forced rebuild CALL")
     p.add_argument("--self-check", action="store_true", help="run pure measurement checks without starting a server")
     a = p.parse_args(argv)
     if a.self_check:
@@ -637,10 +970,14 @@ def parse_args(argv=None):
         p.error("--sizes accepts distinct values from 10000,100000")
     if a.rounds < 3 or a.queries < 1 or a.dim < 1 or a.seed < 0:
         p.error("require rounds >= 3, queries >= 1, dim >= 1, seed >= 0")
-    if not 2 <= a.m <= 256 or not a.m <= a.ef_construction <= 2**31-1 or not K <= a.ef_search <= 2**31-1:
-        p.error("require 2 <= m <= 256, m <= ef-construction <= INT32_MAX, 10 <= ef-search <= INT32_MAX")
+    if not 2 <= a.m <= 256 or not a.m <= a.ef_construction <= 2**31-1 or not K <= a.ef_search <= 160000:
+        p.error("require 2 <= m <= 256, m <= ef-construction <= INT32_MAX, 10 <= ef-search <= 160000")
     if a.min_recall is not None and not 0 <= a.min_recall <= 1:
         p.error("--min-recall must lie in [0,1]")
+    if a.check_rebuild and a.skip_postchecks:
+        p.error("--check-rebuild requires postchecks; remove --skip-postchecks")
+    if not 60 <= a.rebuild_timeout <= 7200:
+        p.error("--rebuild-timeout must lie in [60,7200]")
     return a
 
 
@@ -656,7 +993,7 @@ def main():
     index_parameters = {"m":args.m, "ef_construction":args.ef_construction, "ef_search":args.ef_search}
     report = {"status": "running", "started_at": now(), "runs": [], "datasets": {}, "servers": {},
               "timing_definition": "CREATE client start through completion of the first APPROXIMATE query; "
-              "excludes data generation/import, startup, EXPLAIN, quality queries, restart, and DML",
+              "excludes data generation/import, startup, EXPLAIN, quality queries, restart, DML and optional rebuild",
               "config": {**{k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
                          "server_parameters": PARAMETERS, "index_parameters":index_parameters}}
     servers = []
@@ -701,13 +1038,17 @@ def main():
         report["instance_root"] = str(root)
         for mode, port in [("cpu",2881), ("gpu",2882)]:
             server = Server(mode, port, args.binary, args.helper, args.mysql,
-                            root / mode, args.output / mode)
+                            root / mode, args.output / mode, index_parameters)
             servers.append(server)
             persist()
             server.start()
             server.sql("ALTER SYSTEM SET ob_vector_memory_limit_percentage=30;", database=False)
             server.sql(f"CREATE DATABASE {DATABASE};", database=False)
             report.setdefault("server_versions", {})[mode] = server.sql("SELECT VERSION();")[0].strip()
+            effective = int(server.sql("SELECT @@SESSION.ob_hnsw_ef_search;")[0].strip())
+            if effective != args.ef_search:
+                raise RuntimeError("effective SQL session ef_search differs between requested and observed values")
+            report.setdefault("effective_session_variables", {})[mode] = {"ob_hnsw_ef_search":effective}
             persist()
 
         for n in args.sizes:
@@ -773,6 +1114,16 @@ def main():
                 if not record["restart_same_ids"]:
                     raise RuntimeError(f"{server.mode} query IDs changed after restart")
                 record["dml"] = dml_check(server,args.dim,args.seed,post/"dml",index_parameters)
+                record["snapshot_dml_results"] = str(post/"snapshot-dml"/"results.json")
+                persist()
+                record["snapshot_dml"],snapshot_state = snapshot_dml_check(
+                    server,f"vectors_{n}",x,ids,post/"snapshot-dml")
+                persist()
+                if args.check_rebuild:
+                    record["rebuild_results"] = str(post/"rebuild"/"results.json")
+                    persist()
+                    record["rebuild"] = rebuild_check(server,f"vectors_{n}",snapshot_state,
+                                                       post/"rebuild",args.rebuild_timeout)
                 record["status"] = "ok"
                 persist()
         report["status"] = "ok"

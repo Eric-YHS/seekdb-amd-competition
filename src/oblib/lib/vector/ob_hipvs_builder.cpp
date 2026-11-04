@@ -22,6 +22,7 @@
 #include "lib/ob_errno.h"
 
 #ifdef __linux__
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -77,10 +78,32 @@ class HipvsTempDir
   ~HipvsTempDir()
   {
     if (fd_ >= 0) {
-      for (const char* name : {"vectors.f32", "ids.i64", "index.hnsw", "error.log", "meta.json"}) {
-        ::unlinkat(fd_, name, 0);
+      // A killed helper cannot unlink its randomly named partial serialization.
+      // fdopendir owns fd_; unlinkat stays within this build's private directory
+      // and removes symlinks themselves rather than following their targets.
+      DIR* directory = ::fdopendir(fd_);
+      if (directory != nullptr) {
+        while (true) {
+          errno = 0;
+          struct dirent* entry = ::readdir(directory);
+          if (entry == nullptr) {
+            if (errno == EINTR) {
+              continue;
+            }
+            break;
+          }
+          if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) {
+            continue;
+          }
+          int status;
+          do {
+            status = ::unlinkat(fd_, entry->d_name, 0);
+          } while (status != 0 && errno == EINTR);
+        }
+        ::closedir(directory);
+      } else {
+        ::close(fd_);
       }
-      ::close(fd_);
     }
     if (!path_.empty()) {
       ::rmdir(path_.c_str());

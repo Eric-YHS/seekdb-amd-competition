@@ -27,7 +27,9 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <type_traits>
 #include "vsag/vsag.h"
+#include "vsag/allocator.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
 #include "vsag/search_param.h"
@@ -45,6 +47,47 @@ namespace obvsag {
 using namespace vsag;
 
 static constexpr int64_t VSAG_SINDI_N_CANDIDATE_FACTOR = 500;
+
+// Snapshot staging belongs to the same vector-memory budget as its index.
+template <typename T>
+class HipvsVectorAllocator {
+public:
+  using value_type = T;
+  using propagate_on_container_swap = std::true_type;
+  explicit HipvsVectorAllocator(vsag::Allocator *allocator = nullptr) noexcept : allocator_(allocator) {}
+  template <typename U>
+  HipvsVectorAllocator(const HipvsVectorAllocator<U> &other) noexcept : allocator_(other.get()) {}
+  T *allocate(size_t count)
+  {
+    if (count > SIZE_MAX / sizeof(T)) {
+      throw std::bad_alloc();
+    }
+    void *memory = allocator_ == nullptr ? ::operator new(count * sizeof(T))
+                                         : allocator_->Allocate(count * sizeof(T));
+    if (memory == nullptr) {
+      throw std::bad_alloc();
+    }
+    return static_cast<T *>(memory);
+  }
+  void deallocate(T *memory, size_t) noexcept
+  {
+    if (allocator_ == nullptr) {
+      ::operator delete(memory);
+    } else {
+      allocator_->Deallocate(memory);
+    }
+  }
+  vsag::Allocator *get() const noexcept { return allocator_; }
+  template <typename U>
+  bool operator==(const HipvsVectorAllocator<U> &other) const noexcept { return allocator_ == other.get(); }
+  template <typename U>
+  bool operator!=(const HipvsVectorAllocator<U> &other) const noexcept { return !(*this == other); }
+private:
+  vsag::Allocator *allocator_;
+};
+
+using HipvsFloatBuffer = std::vector<float, HipvsVectorAllocator<float>>;
+using HipvsIdBuffer = std::vector<int64_t, HipvsVectorAllocator<int64_t>>;
 
 static int vsag_errcode2ob(vsag::ErrorType vsag_errcode)
 {
@@ -125,7 +168,9 @@ public:
                    IndexType index_type, std::shared_ptr<vsag::Index> index,
                    vsag::Allocator *allocator, uint64_t extra_info_size,
                    int16_t refine_type, int16_t bq_bits_query, bool bq_use_fht)
-      : is_created_(is_create), is_build_(is_build), use_static_(use_static),
+      : hipvs_vectors_(HipvsVectorAllocator<float>(allocator)),
+        hipvs_ids_(HipvsVectorAllocator<int64_t>(allocator)),
+        is_created_(is_create), is_build_(is_build), use_static_(use_static),
         dtype_(dtype), metric_(metric), max_degree_(max_degree),
         ef_construction_(ef_construction), ef_search_(ef_search), dim_(dim),
         index_type_(index_type), index_(index), allocator_(allocator),
@@ -135,7 +180,9 @@ public:
   HnswIndexHandler(bool is_create, bool is_build, bool use_static, const char *dtype, const char *metric,
       IndexType index_type, std::shared_ptr<vsag::Index> index, vsag::Allocator *allocator, uint64_t extra_info_size,
       bool use_reorder, float doc_prune_ratio, int window_size)
-      : is_created_(is_create),
+      : hipvs_vectors_(HipvsVectorAllocator<float>(allocator)),
+        hipvs_ids_(HipvsVectorAllocator<int64_t>(allocator)),
+        is_created_(is_create),
         is_build_(is_build),
         use_static_(use_static),
         dtype_(dtype),
@@ -208,8 +255,8 @@ private:
   std::mutex hipvs_mutex_;
   enum class HipvsBuildState { CPU, BUFFERING, BUILT };
   HipvsBuildState hipvs_state_ = HipvsBuildState::CPU;
-  std::vector<float> hipvs_vectors_;
-  std::vector<int64_t> hipvs_ids_;
+  HipvsFloatBuffer hipvs_vectors_;
+  HipvsIdBuffer hipvs_ids_;
   bool is_created_;
   bool is_build_;
   bool use_static_;
@@ -297,7 +344,7 @@ int HnswIndexHandler::finish_hipvs_build()
   } else {
     const auto started = std::chrono::steady_clock::now();
     const int64_t rows = static_cast<int64_t>(hipvs_ids_.size());
-    std::vector<int64_t> sorted_ids(hipvs_ids_);
+    HipvsIdBuffer sorted_ids(hipvs_ids_);
     std::sort(sorted_ids.begin(), sorted_ids.end());
     if (std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) != sorted_ids.end()) {
       ret = OB_INVALID_ARGUMENT;
@@ -315,8 +362,8 @@ int HnswIndexHandler::finish_hipvs_build()
         ret = OB_ERR_UNEXPECTED;
       } else {
         hipvs_state_ = HipvsBuildState::BUILT;
-        std::vector<float>().swap(hipvs_vectors_);
-        std::vector<int64_t>().swap(hipvs_ids_);
+        HipvsFloatBuffer(hipvs_vectors_.get_allocator()).swap(hipvs_vectors_);
+        HipvsIdBuffer(hipvs_ids_.get_allocator()).swap(hipvs_ids_);
         LOG_INFO("hipVS small snapshot CPU fallback; excluded from GPU measurements", K(rows), K(dim_));
       }
     } else {
@@ -336,7 +383,7 @@ int HnswIndexHandler::finish_hipvs_build()
           if (!candidate.has_value()) {
             ret = vsag_errcode2ob(candidate.error().type);
           } else {
-            std::istringstream input(serialized, std::ios::in | std::ios::binary);
+            std::istringstream input(std::move(serialized), std::ios::in | std::ios::binary);
             auto imported = candidate.value()->Deserialize(input);
             if (!imported.has_value()) {
               ret = vsag_errcode2ob(imported.error().type);
@@ -347,8 +394,8 @@ int HnswIndexHandler::finish_hipvs_build()
             } else {
               index_ = std::move(candidate.value());
               hipvs_state_ = HipvsBuildState::BUILT;
-              std::vector<float>().swap(hipvs_vectors_);
-              std::vector<int64_t>().swap(hipvs_ids_);
+              HipvsFloatBuffer(hipvs_vectors_.get_allocator()).swap(hipvs_vectors_);
+              HipvsIdBuffer(hipvs_ids_.get_allocator()).swap(hipvs_ids_);
               const int64_t elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started).count();
               LOG_INFO("hipVS HNSW construction complete", K(rows), K(dim_), K(elapsed_us), KCSTRING(diagnostics.c_str()));
@@ -395,6 +442,8 @@ int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
     }
   } catch (const std::bad_alloc &) {
     return OB_ALLOCATE_MEMORY_FAILED;
+  } catch (const std::length_error &) {
+    return OB_SIZE_OVERFLOW;
   }
   tl::expected<std::vector<int64_t>, Error> result = index_->Add(incremental);
   if (result.has_value()) {
