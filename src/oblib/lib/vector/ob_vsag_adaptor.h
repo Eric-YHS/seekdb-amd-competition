@@ -123,6 +123,9 @@ int build_index(VectorIndexPtr& index_handler, float* vector_list, int64_t* ids,
 int build_index(VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size,
     char *extra_info = nullptr);
 int add_index(VectorIndexPtr& index_handler, float* vector, int64_t* ids, int dim, int size, char *extra_info = nullptr);
+// Snapshot-only bulk construction. Incremental DML keeps the VSAG Add path.
+int begin_hipvs_build(VectorIndexPtr &index_handler);
+int finish_hipvs_build(VectorIndexPtr &index_handler);
 int add_index(VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size,
     char *extra_info = nullptr);
 int get_index_number(VectorIndexPtr& index_handler, int64_t &size);

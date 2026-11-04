@@ -8,6 +8,7 @@ set_source_files_properties(
   ${CMAKE_SOURCE_DIR}/src/oblib/lib/oblog/ob_log_compressor.cpp
   PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 ob_lib_add_target(oblib_lib)
+target_sources(oblib_lib PRIVATE vector/ob_hipvs_builder.cpp)
 
 seekdb_apply_unity_inventory(oblib_lib_simd SEEKDB_OBLIB_SIMD_UNITY)
 ob_lib_add_target(oblib_lib_simd)

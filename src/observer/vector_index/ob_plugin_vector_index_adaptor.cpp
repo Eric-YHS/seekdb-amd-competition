@@ -1698,6 +1698,9 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
         // do nothing
       } else if (OB_ISNULL(vids)) {
         ret = OB_ERR_UNEXPECTED;
+      } else if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW &&
+                 !is_sparse_vector_index_type() && num > 0 &&
+                 OB_FAIL(common::obvsag::begin_hipvs_build(snap_data_->index_))) {
       } else {
         uint32_t *lens = nullptr;
         uint32_t *dims = nullptr;
@@ -3168,7 +3171,14 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
-  if (!snap_data_->is_inited()) {
+  if (OB_NOT_NULL(snap_data_)) {
+    TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+    if (OB_NOT_NULL(snap_data_->index_) &&
+        OB_FAIL(common::obvsag::finish_hipvs_build(snap_data_->index_))) {
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(snap_data_) || !snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(obvectorutil::get_index_number(snap_data_->index_, snap_index_size))) {
   } else if (snap_index_size == 0) {

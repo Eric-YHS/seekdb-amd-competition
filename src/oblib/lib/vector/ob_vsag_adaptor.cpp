@@ -17,7 +17,16 @@
 #define USING_LOG_PREFIX LIB
 
 #include "ob_vsag_adaptor.h"
+#include "ob_hipvs_builder.h"
+#include <algorithm>
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <mutex>
+#include <sstream>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
@@ -145,6 +154,8 @@ public:
     LOG_INFO("[OBVSAG] after deconstruction, hnsw index", KP(allocator_), K(index_.use_count()), K(lbt()));
   }
   int build_index(const vsag::DatasetPtr &base);
+  int begin_hipvs_build();
+  int finish_hipvs_build();
   int get_index_number();
   int add_index(const vsag::DatasetPtr &incremental);
   int cal_distance_by_id(const float *vector, const int64_t *ids, int64_t count,
@@ -194,6 +205,11 @@ public:
       K_(refine_type), K_(bq_bits_query), K_(bq_use_fht));
 
 private:
+  std::mutex hipvs_mutex_;
+  enum class HipvsBuildState { CPU, BUFFERING, BUILT };
+  HipvsBuildState hipvs_state_ = HipvsBuildState::CPU;
+  std::vector<float> hipvs_vectors_;
+  std::vector<int64_t> hipvs_ids_;
   bool is_created_;
   bool is_build_;
   bool use_static_;
@@ -236,12 +252,150 @@ int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 
 int HnswIndexHandler::get_index_number()
 {
+  std::lock_guard<std::mutex> guard(hipvs_mutex_);
+  if (hipvs_state_ == HipvsBuildState::BUFFERING) {
+    return static_cast<int>(hipvs_ids_.size());
+  }
   return index_->GetNumElements();
+}
+
+int HnswIndexHandler::begin_hipvs_build()
+{
+  int ret = OB_SUCCESS;
+  const char *enabled = std::getenv("SEEKDB_HIPVS_BUILD");
+  if (enabled == nullptr || enabled[0] == '\0' || std::strcmp(enabled, "0") == 0) {
+    // The default CPU construction path retains its existing behavior.
+  } else if (std::strcmp(enabled, "1") != 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("hipVS build requires SEEKDB_HIPVS_BUILD=0 or 1", K(ret));
+  } else {
+    std::lock_guard<std::mutex> guard(hipvs_mutex_);
+    if (hipvs_state_ != HipvsBuildState::CPU) {
+    } else if (index_type_ != HNSW_TYPE || dtype_ == nullptr || metric_ == nullptr ||
+               std::strcmp(dtype_, "float32") != 0 || std::strcmp(metric_, "l2") != 0 ||
+               extra_info_size_ != 0 || dim_ <= 0) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("hipVS snapshot build requires dense float32 L2 HNSW", K(ret), K(index_type_), K(dim_), K(extra_info_size_));
+    } else if (index_->GetNumElements() != 0) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("hipVS snapshot build must begin with an empty index", K(ret));
+    } else {
+      hipvs_state_ = HipvsBuildState::BUFFERING;
+      LOG_INFO("hipVS snapshot collection started", K(dim_), K(max_degree_), K(ef_construction_));
+    }
+  }
+  return ret;
+}
+
+int HnswIndexHandler::finish_hipvs_build()
+{
+  int ret = OB_SUCCESS;
+  std::lock_guard<std::mutex> guard(hipvs_mutex_);
+  if (hipvs_state_ != HipvsBuildState::BUFFERING) {
+  } else if (hipvs_ids_.empty()) {
+    hipvs_state_ = HipvsBuildState::BUILT;
+  } else {
+    const auto started = std::chrono::steady_clock::now();
+    const int64_t rows = static_cast<int64_t>(hipvs_ids_.size());
+    std::vector<int64_t> sorted_ids(hipvs_ids_);
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    if (std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) != sorted_ids.end()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("hipVS snapshot contains duplicate vector IDs", K(ret), K(rows));
+    } else if (rows <= std::max<int64_t>(4LL * max_degree_, 64)) {
+      // NN-descent requires more rows than its intermediate graph degree.
+      // Keep small SQL tables usable and identify this as CPU work explicitly.
+      auto data = vsag::Dataset::Make();
+      data->Dim(dim_)->NumElements(rows)->Ids(hipvs_ids_.data())
+          ->Float32Vectors(hipvs_vectors_.data())->Owner(false);
+      auto built = index_->Build(data);
+      if (!built.has_value()) {
+        ret = vsag_errcode2ob(built.error().type);
+      } else if (!built.value().empty() || index_->GetNumElements() != rows) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        hipvs_state_ = HipvsBuildState::BUILT;
+        std::vector<float>().swap(hipvs_vectors_);
+        std::vector<int64_t>().swap(hipvs_ids_);
+        LOG_INFO("hipVS small snapshot CPU fallback; excluded from GPU measurements", K(rows), K(dim_));
+      }
+    } else {
+      std::string serialized;
+      std::string error;
+      std::string diagnostics;
+      if (OB_FAIL(build_hipvs_hnsw(hipvs_vectors_.data(), hipvs_ids_.data(), rows, dim_,
+                                  max_degree_, ef_construction_, serialized, error, diagnostics))) {
+        LOG_WARN("hipVS construction failed; index not published", K(ret), K(rows), KCSTRING(error.c_str()));
+      } else {
+        char parameters[1024] = {0};
+        if (OB_FAIL(construct_vsag_create_param(HNSW_TYPE, dtype_, metric_, dim_, max_degree_,
+                         ef_construction_, ef_search_, allocator_, 0, refine_type_, bq_bits_query_,
+                         bq_use_fht_, parameters))) {
+        } else {
+          auto candidate = vsag::Factory::CreateIndex("hnsw", parameters, allocator_);
+          if (!candidate.has_value()) {
+            ret = vsag_errcode2ob(candidate.error().type);
+          } else {
+            std::istringstream input(serialized, std::ios::in | std::ios::binary);
+            auto imported = candidate.value()->Deserialize(input);
+            if (!imported.has_value()) {
+              ret = vsag_errcode2ob(imported.error().type);
+              LOG_WARN("hipVS HNSW import failed", K(ret), KCSTRING(imported.error().message.c_str()));
+            } else if (candidate.value()->GetNumElements() != rows) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("hipVS HNSW imported row count mismatch", K(ret), K(rows));
+            } else {
+              index_ = std::move(candidate.value());
+              hipvs_state_ = HipvsBuildState::BUILT;
+              std::vector<float>().swap(hipvs_vectors_);
+              std::vector<int64_t>().swap(hipvs_ids_);
+              const int64_t elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - started).count();
+              LOG_INFO("hipVS HNSW construction complete", K(rows), K(dim_), K(elapsed_us), KCSTRING(diagnostics.c_str()));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
 }
 
 int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
 {
   int ret = OB_SUCCESS;
+  try {
+    std::lock_guard<std::mutex> guard(hipvs_mutex_);
+    if (hipvs_state_ == HipvsBuildState::BUFFERING) {
+      const int64_t count = incremental->GetNumElements();
+      const float *vectors = incremental->GetFloat32Vectors();
+      const int64_t *ids = incremental->GetIds();
+      if (count < 0 || count > INT_MAX - static_cast<int64_t>(hipvs_ids_.size()) ||
+          incremental->GetDim() != dim_ || vectors == nullptr || ids == nullptr ||
+          static_cast<uint64_t>(count) > (SIZE_MAX / sizeof(float) - hipvs_vectors_.size()) / dim_) {
+        return OB_INVALID_ARGUMENT;
+      }
+      const size_t values = static_cast<size_t>(count) * dim_;
+      for (size_t i = 0; i < values; ++i) {
+        if (!std::isfinite(vectors[i])) {
+          return OB_INVALID_ARGUMENT;
+        }
+      }
+      const size_t new_rows = hipvs_ids_.size() + count;
+      const size_t new_values = hipvs_vectors_.size() + values;
+      if (new_rows > hipvs_ids_.capacity()) {
+        hipvs_ids_.reserve(std::max(new_rows, hipvs_ids_.capacity() * 2));
+      }
+      if (new_values > hipvs_vectors_.capacity()) {
+        hipvs_vectors_.reserve(std::max(new_values, hipvs_vectors_.capacity() * 2));
+      }
+      hipvs_vectors_.insert(hipvs_vectors_.end(), vectors, vectors + values);
+      hipvs_ids_.insert(hipvs_ids_.end(), ids, ids + count);
+      return OB_SUCCESS;
+    }
+  } catch (const std::bad_alloc &) {
+    return OB_ALLOCATE_MEMORY_FAILED;
+  }
   tl::expected<std::vector<int64_t>, Error> result = index_->Add(incremental);
   if (result.has_value()) {
     LOG_DEBUG("add index success", K(get_index_number()));
@@ -975,6 +1129,42 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
       dataset->ExtraInfos(extra_infos);
     }
     if (OB_FAIL(hnsw->build_index(dataset))) {
+    }
+  }
+  return ret;
+}
+
+int begin_hipvs_build(VectorIndexPtr &index_handler)
+{
+  int ret = OB_SUCCESS;
+  if (index_handler == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    try {
+      ret = static_cast<HnswIndexHandler *>(index_handler)->begin_hipvs_build();
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } catch (const std::exception &e) {
+      ret = OB_ERR_VSAG_RETURN_ERROR;
+      LOG_WARN("hipVS snapshot collection failed", K(ret), "what", e.what());
+    }
+  }
+  return ret;
+}
+
+int finish_hipvs_build(VectorIndexPtr &index_handler)
+{
+  int ret = OB_SUCCESS;
+  if (index_handler == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    try {
+      ret = static_cast<HnswIndexHandler *>(index_handler)->finish_hipvs_build();
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } catch (const std::exception &e) {
+      ret = OB_ERR_VSAG_RETURN_ERROR;
+      LOG_WARN("hipVS snapshot construction failed", K(ret), "what", e.what());
     }
   }
   return ret;
