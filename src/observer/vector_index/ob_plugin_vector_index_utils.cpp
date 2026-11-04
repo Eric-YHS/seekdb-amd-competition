@@ -648,6 +648,9 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObPluginVectorIndexAdapt
   ObPluginVectorIndexAdaptor *new_adapter = nullptr;
   ObPluginVectorIndexMgr *vec_idx_mgr = nullptr;
   int64_t index_count = 0;
+  const bool reload_expected = OB_NOT_NULL(adapter) &&
+      ((OB_NOT_NULL(adapter->get_snap_data_()) && adapter->get_snap_data_()->is_snapshot_evicted()) ||
+       adapter->get_snapshot_key_prefix() == ObString("renew"));
 
   void *adpt_buff = nullptr;
   if (OB_FAIL(read_local_tablet(adapter,
@@ -663,12 +666,14 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObPluginVectorIndexAdapt
     ObTableScanIterator *table_scan_iter = static_cast<ObTableScanIterator *>(snapshot_idx_iter);
     if (OB_FAIL(table_scan_iter->get_next_row(row))) {
       if (OB_ITER_END == ret) {
-        ret = OB_SUCCESS;
+        // Keep reload_finish false while an evicted snapshot is not visible.
+        // The next SQL retry will obtain a fresh SCN and scan iterator.
+        ret = reload_expected ? OB_SCHEMA_EAGAIN : OB_SUCCESS;
       } else {
       }
     } else if (OB_ISNULL(row) || row->get_column_count() < 2) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (adapter->get_snapshot_key_prefix().empty() || 
+    } else if (reload_expected || adapter->get_snapshot_key_prefix().empty() ||
                !row->storage_datums_[0].get_string().prefix_match(adapter->get_snapshot_key_prefix())) {
       ObString key_prefix;
       ObString target_prefix;
@@ -724,7 +729,11 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObPluginVectorIndexAdapt
           } else if (OB_FAIL(obvectorutil::get_index_number(snap_memdata->index_, index_count))) {
             ret = OB_ERR_VSAG_RETURN_ERROR;
           } else if (index_count == 0) {
-            free_memdata_resource(VIRT_SNAP, snap_memdata, new_adapter->get_allocator());
+            if (reload_expected || snap_memdata->is_snapshot_evicted()) {
+              ret = OB_SCHEMA_EAGAIN;
+            } else {
+              free_memdata_resource(VIRT_SNAP, snap_memdata, new_adapter->get_allocator());
+            }
             //should not release mem_ctx here, create by init_mem, not init_memdata
             //if (OB_NOT_NULL(snap_memdata->mem_ctx_)) {
             //  snap_memdata->mem_ctx_->~ObVsagMemContext();
@@ -733,6 +742,7 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObPluginVectorIndexAdapt
             //}
             LOG_INFO("memdata sync snapshot index complement no data", K(index_count), K(index_type), KPC(new_adapter));
           } else { // index_count > 0
+            snap_memdata->set_snapshot_evicted(false);
             new_adapter->close_snap_data_rb_flag();
             LOG_INFO("memdata sync snapshot index complement data", K(index_count), K(index_type), KPC(new_adapter));
           }

@@ -420,6 +420,7 @@ struct ObVectorIndexMemData
   ObVectorIndexMemData()
     : is_init_(false),
       rb_flag_(true),
+      snapshot_evicted_(false),
       has_build_sq_(false),
       vid_array_(nullptr),
       vec_array_(nullptr),
@@ -437,10 +438,12 @@ struct ObVectorIndexMemData
       can_skip_(NOT_INITED) {}
 
 public:
-  TO_STRING_KV(K(rb_flag_), K_(is_init), K_(scn), K_(ref_cnt), K(vid_bound_.max_vid_), K(vid_bound_.min_vid_), KP_(index), KPC_(bitmap), KP_(mem_ctx));
+  TO_STRING_KV(K(rb_flag_), K_(snapshot_evicted), K_(is_init), K_(scn), K_(ref_cnt), K(vid_bound_.max_vid_), K(vid_bound_.min_vid_), KP_(index), KPC_(bitmap), KP_(mem_ctx));
   void free_resource(ObIAllocator *allocator_);
   bool is_inited() const { return is_init_; }
   void set_inited() { is_init_ = true; }
+  bool is_snapshot_evicted() const { return ATOMIC_LOAD(&snapshot_evicted_); }
+  void set_snapshot_evicted(bool value) { ATOMIC_STORE(&snapshot_evicted_, value); }
   void set_vid_bound(ObVidBound other) {
     vid_bound_.max_vid_ = vid_bound_.max_vid_ > other.max_vid_ ? vid_bound_.max_vid_ : other.max_vid_;
     vid_bound_.min_vid_ = vid_bound_.min_vid_ < other.min_vid_ ? vid_bound_.min_vid_ : other.min_vid_;
@@ -468,6 +471,7 @@ public:
 public:
   bool is_init_;
   bool rb_flag_;
+  bool snapshot_evicted_;
   bool has_build_sq_; // for hnsw+sq
   ObVecIdxVidArray *vid_array_; // for hnsw+sq
   ObVecIdxVecArray *vec_array_; // for hnsw+sq
@@ -604,7 +608,7 @@ public:
   uint64_t get_rowkey_vid_table_id() { return rowkey_vid_table_id_; }
   uint64_t get_vid_rowkey_table_id() { return vid_rowkey_table_id_; }
   void close_snap_data_rb_flag() {
-    if (is_mem_data_init_atomic(VIRT_SNAP)) {
+    if (is_mem_data_init_atomic(VIRT_SNAP) && !snap_data_->is_snapshot_evicted()) {
       snap_data_->rb_flag_ = false;
     }
   }

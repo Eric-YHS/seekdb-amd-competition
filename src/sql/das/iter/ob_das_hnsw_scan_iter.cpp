@@ -2670,7 +2670,7 @@ int ObDASHNSWScanIter::process_adaptor_state_post_filter_once(
       // Normal skip mode: decide path based on rb_flag_
       if (OB_FAIL(ada_ctx->init_bitmaps())) {
       } else {
-        if (adaptor->get_snap_data_()->rb_flag_) {
+        if (adaptor->get_snap_data_()->rb_flag_ || adaptor->get_snap_data_()->is_snapshot_evicted()) {
           ada_ctx->set_status(PVQ_LACK_SCN);
           ada_ctx->set_flag(PVQP_SECOND);
           cur_state = ObVidAdaLookupStatus::QUERY_SNAPSHOT_TBL;

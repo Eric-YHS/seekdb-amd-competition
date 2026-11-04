@@ -2350,7 +2350,7 @@ int ObPluginVectorIndexAdaptor::check_index_id_table_readnext_status(ObVectorQue
   // TODO First determine if waiting for PVQ_WAIT is needed
   if (OB_ISNULL(ctx) || OB_ISNULL(table_scan_iter)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (snap_data_->rb_flag_) {
+  } else if (snap_data_->rb_flag_ || snap_data_->is_snapshot_evicted()) {
     ctx->status_ = PVQ_LACK_SCN;
     ctx->flag_ = PVQP_SECOND;
   } else {
@@ -2492,7 +2492,7 @@ int ObPluginVectorIndexAdaptor::check_index_id_table_readnext_status_async(
           }
         }
         if (OB_SUCC(ret) && ctx->status_ != PVQ_COM_DATA) {
-          if (snap_data_->rb_flag_) {
+          if (snap_data_->rb_flag_ || snap_data_->is_snapshot_evicted()) {
             ctx->status_ = PVQ_LACK_SCN;
             ctx->flag_ = PVQP_SECOND;
           } else {
@@ -2529,7 +2529,7 @@ int ObPluginVectorIndexAdaptor::check_index_id_table_readnext_status_async(
         }
       }
       if (OB_SUCC(ret) && ctx->status_ != PVQ_COM_DATA) {
-        if (snap_data_->rb_flag_) {
+        if (snap_data_->rb_flag_ || snap_data_->is_snapshot_evicted()) {
           ctx->status_ = PVQ_LACK_SCN;
           ctx->flag_ = PVQP_SECOND;
         } else {
@@ -3203,8 +3203,16 @@ int ObPluginVectorIndexAdaptor::renew_single_snap_index(bool mem_saving_mode)
       ret = OB_ERR_UNEXPECTED;
     } else {
       TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
-      if (OB_FAIL(renew_snapdata_in_lock())) {
-      } else if (OB_FAIL(set_snapshot_key_prefix(invalid_prefix))) {
+      int64_t row_count = 0;
+      if (OB_NOT_NULL(snap_data_->index_) &&
+          OB_FAIL(obvectorutil::get_index_number(snap_data_->index_, row_count))) {
+      } else if (row_count > 0) {
+        // All adaptors sharing this snapshot must reload after its graph is evicted.
+        snap_data_->set_snapshot_evicted(true);
+        snap_data_->rb_flag_ = true;
+        if (OB_FAIL(renew_snapdata_in_lock())) {
+        } else if (OB_FAIL(set_snapshot_key_prefix(invalid_prefix))) {
+        }
       }
     }
   // snap_data_->index_ is null for empty table
@@ -3587,7 +3595,9 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
     ifilter.is_snap_ = true;
     dfilter.is_snap_ = true;
     bool is_pre_filter = ctx->is_prefilter_valid();
-    if (is_sparse_vector_index_type() && is_mem_data_init_atomic(VIRT_SNAP) &&
+    if (snap_data_->is_snapshot_evicted()) {
+      ret = OB_SCHEMA_EAGAIN;
+    } else if (is_sparse_vector_index_type() && is_mem_data_init_atomic(VIRT_SNAP) &&
       OB_FAIL(obvectorutil::knn_search(get_snap_index(),
                                          sparse_lens[0],
                                          sparse_dims,
@@ -3880,7 +3890,9 @@ int ObPluginVectorIndexAdaptor::query_next_result(ObVectorQueryAdaptorResultCont
       TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
 
       bool is_pre_filter = ctx->is_prefilter_valid();
-      if (snap_cnt > 0 && is_mem_data_init_atomic(VIRT_SNAP)) {
+      if (snap_data_->is_snapshot_evicted()) {
+        ret = OB_SCHEMA_EAGAIN;
+      } else if (snap_cnt > 0 && is_mem_data_init_atomic(VIRT_SNAP)) {
         if (OB_FAIL(obvectorutil::knn_search(get_snap_index(),
                                              query_vector,
                                              dim,
@@ -3994,8 +4006,16 @@ int ObPluginVectorIndexAdaptor::query_result(ObVectorQueryAdaptorResultContext *
   } else if (OB_FALSE_IT(vids_iter = new(iter_buff) ObVectorQueryVidIterator(query_cond->extra_column_count_, extra_info_actual_size, query_cond->rel_count_, query_cond->rel_map_ptr_))) {
   }
 
-  const bool need_load_data_from_table = (ctx->flag_ == PVQP_SECOND || !ctx->get_ls_leader()) ? true : false;
+  const bool snapshot_evicted = OB_NOT_NULL(snap_data_) && snap_data_->is_snapshot_evicted();
+  const bool need_load_data_from_table = snapshot_evicted ||
+      get_snapshot_key_prefix() == ObString("renew") || ctx->flag_ == PVQP_SECOND || !ctx->get_ls_leader();
   if (OB_FAIL(ret)) {
+  } else if ((snapshot_evicted || get_snapshot_key_prefix() == ObString("renew")) &&
+             get_create_type() == CreateTypeComplete) {
+    // Memory-saving eviction leaves a persisted snapshot to reload, not an
+    // empty index. Refresh at a new SCN before allowing this cache to answer.
+    ctx->status_ = PVQ_REFRESH;
+    LOG_INFO("reload evicted vector snapshot before query", K(ret), K(snapshot_tablet_id_), K(get_create_type()));
   } else if (!need_load_data_from_table) {
     if (query_cond->only_complete_data_) {
       // do nothing
@@ -4003,18 +4023,22 @@ int ObPluginVectorIndexAdaptor::query_result(ObVectorQueryAdaptorResultContext *
     }
   } else { // need load data
     if (OB_ISNULL(query_cond->row_iter_) || OB_ISNULL(query_cond->scan_param_)) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = (snap_data_->is_snapshot_evicted() || get_snapshot_key_prefix() == ObString("renew"))
+          ? OB_SCHEMA_EAGAIN : OB_ERR_UNEXPECTED;
     } else {
       blocksstable::ObDatumRow *row = nullptr;
       ObTableScanIterator *table_scan_iter = static_cast<ObTableScanIterator *>(query_cond->row_iter_);
       if (OB_FAIL(table_scan_iter->get_next_row(row))) {
         if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
+          // A concurrent eviction must retain its reload requirement even if
+          // this statement's snapshot cannot see the persisted rows yet.
+          ret = (snap_data_->is_snapshot_evicted() || get_snapshot_key_prefix() == ObString("renew"))
+              ? OB_SCHEMA_EAGAIN : OB_SUCCESS;
         } else {
         }
       } else if (OB_ISNULL(row) || row->get_column_count() < 2) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (get_snapshot_key_prefix().empty() ||
+      } else if (snap_data_->is_snapshot_evicted() || get_snapshot_key_prefix().empty() ||
           !row->storage_datums_[0].get_string().prefix_match(get_snapshot_key_prefix()))
       {
         if (get_create_type() == CreateTypeComplete) {
@@ -4076,13 +4100,22 @@ int ObPluginVectorIndexAdaptor::deserialize_snap_data(ObVectorQueryConditions *q
     ObVectorIndexSerializer index_seri(tmp_allocator);
     TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
     ObString target_prefix;
-    if (!get_snapshot_key_prefix().empty() && key_prefix.prefix_match(get_snapshot_key_prefix()) && !snap_data_->rb_flag_) {
+    int64_t index_count = 0;
+    const bool reload_expected = snap_data_->is_snapshot_evicted() ||
+        get_snapshot_key_prefix() == ObString("renew");
+    if (!reload_expected && !get_snapshot_key_prefix().empty() &&
+        key_prefix.prefix_match(get_snapshot_key_prefix()) && !snap_data_->rb_flag_) {
       // skip deserialize, already been deserialized by other concurrent thread
     } else if (OB_FAIL(index_seri.deserialize(snap_data_->index_, param, cb))) {
+    } else if (OB_FAIL(obvectorutil::get_index_number(snap_data_->index_, index_count))) {
+    } else if (reload_expected && index_count == 0) {
+      ret = OB_SCHEMA_EAGAIN;
     } else if (OB_FAIL(obvectorutil::immutable_optimize(snap_data_->index_))) {
     } else if (OB_FALSE_IT(index_type = get_snap_index_type())) {
     } else if (OB_FAIL(ObPluginVectorIndexUtils::get_split_snapshot_prefix(index_type, key_prefix, target_prefix))) {
     } else if (OB_FAIL(set_snapshot_key_prefix(target_prefix))) {
+    } else if (index_count > 0) {
+      snap_data_->set_snapshot_evicted(false);
     }
   }
   return ret;
@@ -4219,7 +4252,7 @@ int ObPluginVectorIndexAdaptor::set_adaptor_ctx_flag(ObVectorQueryAdaptorResultC
   if (OB_ISNULL(ctx)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ctx->flag_ = snap_data_->rb_flag_ ? PVQP_SECOND : PVQP_FIRST;
+    ctx->flag_ = (snap_data_->rb_flag_ || snap_data_->is_snapshot_evicted()) ? PVQP_SECOND : PVQP_FIRST;
   }
 
   return ret;
