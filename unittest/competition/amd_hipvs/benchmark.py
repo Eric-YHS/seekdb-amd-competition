@@ -45,6 +45,7 @@ STORED_VECTOR_L2_TOLERANCE = 1e-7
 PARAMETERS = {
     "memory_budget": "8G",
     "vector_memory_limit": "3G",
+    "vector_index_memory_saving_mode": "True",
     "cpu_count": "16",
     "datafile_size": "2G",
     "datafile_maxsize": "8G",
@@ -356,6 +357,19 @@ class Server:
             if limit != expected_limit:
                 raise RuntimeError(f"{self.mode} effective vector memory limit {limit} differs from {requested}")
             entry["effective_vector_memory"] = {"used":used,"hold":hold,"limit":limit}
+            saving_info, _ = self.sql(
+                "SHOW PARAMETERS LIKE 'vector_index_memory_saving_mode';",
+                database=False, timeout=5, record=False)
+            saving_values = []
+            for line in saving_info.splitlines():
+                columns = line.split("\t")
+                if "vector_index_memory_saving_mode" in columns:
+                    position = columns.index("vector_index_memory_saving_mode")
+                    if position + 2 < len(columns):
+                        saving_values.append(columns[position + 2].lower())
+            if not saving_values or any(value not in ("true", "1", "on") for value in saving_values):
+                raise RuntimeError(f"{self.mode} memory-saving mode is not enabled: {saving_info}")
+            entry["effective_vector_index_memory_saving_mode"] = saving_values
             entry["ready_seconds"] = time.perf_counter() - started
             entry["ready_at"] = now()
             return
