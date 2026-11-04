@@ -39,7 +39,8 @@ INDEX = "hnsw_idx"
 DATABASE = "amd_hipvs_benchmark"
 K = 10
 PARAMETERS = {
-    "memory_limit": "8G",
+    "memory_budget": "8G",
+    "vector_memory_limit": "3G",
     "cpu_count": "16",
     "datafile_size": "2G",
     "datafile_maxsize": "8G",
@@ -338,6 +339,19 @@ class Server:
             if int(effective.strip()) != self.index_parameters["ef_search"]:
                 raise RuntimeError(f"{self.mode} effective session ob_hnsw_ef_search differs from CLI")
             entry["effective_session_ob_hnsw_ef_search"] = int(effective.strip())
+            vector_info, _ = self.sql(
+                "SELECT vector_mem_used,vector_mem_hold,vector_mem_limit "
+                "FROM oceanbase.__all_virtual_vector_mem_info;",
+                database=False, timeout=5, record=False)
+            used, hold, limit = map(int, vector_info.strip().split("\t"))
+            requested = PARAMETERS["vector_memory_limit"]
+            match = re.fullmatch(r"([0-9]+)([KMG]?)", requested.upper())
+            if match is None:
+                raise RuntimeError("unsupported vector_memory_limit unit in benchmark configuration")
+            expected_limit = int(match[1]) * {"":1,"K":1024,"M":1024**2,"G":1024**3}[match[2]]
+            if limit != expected_limit:
+                raise RuntimeError(f"{self.mode} effective vector memory limit {limit} differs from {requested}")
+            entry["effective_vector_memory"] = {"used":used,"hold":hold,"limit":limit}
             entry["ready_seconds"] = time.perf_counter() - started
             entry["ready_at"] = now()
             return
@@ -966,8 +980,8 @@ def parse_args(argv=None):
         a.sizes = [int(s) for s in a.sizes.split(",")]
     except ValueError:
         p.error("--sizes must be comma-separated integers")
-    if not a.sizes or len(a.sizes) != len(set(a.sizes)) or any(n not in (10000,100000) for n in a.sizes):
-        p.error("--sizes accepts distinct values from 10000,100000")
+    if not a.sizes or len(a.sizes) != len(set(a.sizes)) or any(n not in (10000,100000,1000000) for n in a.sizes):
+        p.error("--sizes accepts distinct values from 10000,100000,1000000")
     if a.rounds < 3 or a.queries < 1 or a.dim < 1 or a.seed < 0:
         p.error("require rounds >= 3, queries >= 1, dim >= 1, seed >= 0")
     if not 2 <= a.m <= 256 or not a.m <= a.ef_construction <= 2**31-1 or not K <= a.ef_search <= 160000:
@@ -1042,7 +1056,6 @@ def main():
             servers.append(server)
             persist()
             server.start()
-            server.sql("ALTER SYSTEM SET ob_vector_memory_limit_percentage=30;", database=False)
             server.sql(f"CREATE DATABASE {DATABASE};", database=False)
             report.setdefault("server_versions", {})[mode] = server.sql("SELECT VERSION();")[0].strip()
             effective = int(server.sql("SELECT @@SESSION.ob_hnsw_ef_search;")[0].strip())

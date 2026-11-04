@@ -73,6 +73,8 @@ python unittest/competition/amd_hipvs/benchmark.py \
 
 程序对每条 SQL 连接显式设置 `ob_hnsw_ef_search`，读取并保存实际会话值，保证 CPU/GPU 使用相同查询预算。
 
+两实例均设置逻辑内存预算 `memory_budget=8G`、向量内存限额 `vector_memory_limit=3G` 和 `cpu_count=16`。启动及重启时读取向量内存虚拟表，核对实际生效的限额。`--sizes` 支持 10000、100000、1000000，按相同配置检查不同数据规模。
+
 `results.json` 保存每轮耗时、中位数加速比、Recall@10、文档 ID 与距离检查、执行计划、GPU 构建日志、二进制 SHA256 和环境配置。程序还验证实例重启后的查询结果，以及对原有 snapshot 行的更新、删除和新行插入，并在这些变更后再次重启核对。添加 `--check-rebuild` 可继续检查强制重建及其完成日志。通过 `--min-recall` 指定质量门槛，使用比赛统一配置判断结果。
 
 ## 回归检查
@@ -83,6 +85,15 @@ python unittest/competition/amd_hipvs/benchmark.py \
 python unittest/competition/amd_hipvs/test_process_bridge.py
 python unittest/competition/amd_hipvs/test_process_bridge.py --sanitizers
 python unittest/competition/amd_hipvs/benchmark.py --self-check
+```
+
+向量内存回归先验证 80 MiB 限额下构建失败、缓存用量归零，再恢复 3 GiB 并重建同一批 20 万条向量：
+
+```bash
+python unittest/competition/amd_hipvs/test_vector_budget.py \
+  --binary "$(pwd)/build_release/src/observer/seekdb" \
+  --helper "$(pwd)/build_hipvs/seekdb_hipvs_build" \
+  --output /workspace/hipvs-results/vector-budget
 ```
 
 构建器依赖 hipVS 的 64 位 hnswlib 序列化布局。升级 hipVS 或 VSAG 时，重新执行导入、查询、保存和恢复测试。
